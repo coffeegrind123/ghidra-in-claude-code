@@ -1,82 +1,48 @@
-# Ghidra MCP Workflow Guide
+# Ghidra MCP Workflow Guide (v5.0.0)
 
-## Loading Binaries into Ghidra Headless MCP
+## Loading Binaries
 
-The Ghidra MCP headless server (`GhidraMCPHeadlessServer`) does NOT expose a `load_program` MCP tool through the Python bridge. You must use the HTTP API directly.
-
-### Step 1: Verify Connection
-
-Use the MCP tool `check_connection` to confirm the server is running.
-
-### Step 2: Load a Binary
-
-The headless server has a `/load_program` HTTP endpoint that is NOT mapped to an MCP tool. Call it directly via curl:
+The headless server's `/load_program` is NOT an MCP tool. Load via HTTP:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8089/load_program -d "file=/absolute/path/to/binary.dll"
+curl -s -X POST http://127.0.0.1:8089/load_program -d "file=/absolute/path/to/binary"
 ```
 
-Returns: `{"success": true, "program": "binary.dll"}`
+Then: `run_analysis` + `get_current_program_info`
 
-### Step 3: Run Analysis
+## Key Rules
 
-Use the MCP tool `run_analysis` to trigger Ghidra's auto-analysis on the loaded program.
+1. **Pre-flight**: Always `check_connection` before any work.
+2. **Save**: `save_program` after every 5-10 mutations. No auto-save.
+3. **Ordering**: `set_function_prototype` WIPES plate comments. All naming/type changes BEFORE comments.
+4. **Phantom variables**: `extraout_*`, `in_*` with undefined types — skip, note in plate comment.
+5. **Hungarian notation**: All renames use Hungarian prefixes. Types BEFORE renaming.
+6. **Name collisions**: `search_functions_enhanced` before `rename_function`.
+7. **Context budget**: Always use offset/limit on `batch_decompile` and `list_functions`.
+8. **Type normalization**: Use lowercase builtins (uint, ushort, byte) not Windows types (DWORD, USHORT).
 
-### Step 4: Use MCP Tools Normally
+## v5.0.0 Breaking Changes
 
-Once loaded and analyzed, all MCP tools work: `list_exports`, `list_imports`, `list_strings`, `decompile_function`, `search_byte_patterns`, etc.
+- `batch_rename_variables` is now `rename_variables`
+- `add_struct_field` uses `replaceAtOffset` (overlays undefined bytes, doesn't shift)
+- `set_local_variable_type` rejects undefined→undefined no-ops
+- Struct field names auto-prefixed with Hungarian notation
+- New `set_variables` tool: atomic type + rename in one transaction
+- New `check_tools` tool: verify if tools are callable
 
-## Key Gotchas
+## HTTP Endpoints (not MCP tools)
 
-- **No import MCP tool**: The Python bridge (`bridge_mcp_ghidra.py`) does not expose `/load_program` as an MCP tool. You MUST use the HTTP endpoint directly.
-- **No GUI tools**: `open_program`, `launch_codebrowser`, `list_project_files` all require GUI mode and will error in headless mode.
-- **Create project first** (optional): `create_project` MCP tool works, but `/load_program` can load binaries without a project.
-- **Java version**: Ghidra 12.0.3 requires Java 21 LTS.
-- **Default port**: The headless server runs on `127.0.0.1:8089` by default.
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/load_program` | POST | Load binary from disk |
+| `/close_program` | POST | Close a loaded program |
+| `/open_project` | POST | Open .gpr project |
+| `/close_project` | POST | Close current project |
+| `/create_project` | POST | Create new project |
 
-## Useful HTTP Endpoints Not in MCP Bridge
+## Tips
 
-These endpoints exist on the headless HTTP server but are NOT exposed as MCP tools:
-
-| Endpoint | Method | Params | Purpose |
-|----------|--------|--------|---------|
-| `/load_program` | POST | `file=<path>` | Import and load a binary from disk |
-| `/close_program` | POST | `name=<name>` | Close a loaded program |
-| `/open_project` | POST | `path=<path>` | Open an existing .gpr project |
-| `/close_project` | POST | (none) | Close the current project |
-| `/load_program_from_project` | POST | `path=<path>` | Load a program from within a project |
-| `/get_project_info` | GET | (none) | Get current project details |
-| `/create_project` | POST | `parentDir`, `name` | Create a new project |
-| `/delete_project` | POST | `projectPath` | Delete a project |
-
-## Reverse Engineering Workflow
-
-### Initial Recon
-1. `list_exports` - Find entry points and exported functions
-2. `list_imports` - Identify libraries and APIs used
-3. `list_strings` with `filter` param - Search for interesting strings (IPs, paths, format strings, error messages)
-
-### Finding Code
-- `search_byte_patterns` - Find references to string addresses or byte sequences (e.g., search for little-endian address `ac eb 44 00` to find xrefs to string at `0x0044ebac`)
-- `get_xrefs_to` - Find cross-references to an address (only works if Ghidra has properly analyzed the referring code)
-- `get_function_by_address` - Check if an address is inside a known function
-
-### Dealing with Unanalyzed Code
-Ghidra's auto-analysis may miss functions, especially in Delphi/BCB binaries:
-- `read_memory` to examine raw bytes at an address
-- Look for function prologues: `55 8B EC` (push ebp; mov ebp, esp) or `55 8B EC 83 C4` / `55 8B EC 81 C4` (with stack frame)
-- `create_function` at the prologue address to define the function
-- `decompile_function` to get pseudocode
-
-### Dynamic Imports
-Some binaries load APIs at runtime via `GetProcAddress` instead of the import table. Look for:
-- API name strings (e.g., `"sendto"`, `"recvfrom"`) in the string list
-- These won't appear in `list_imports` - they're resolved at runtime
-- Search for the string address bytes to find the loading code
-
-### Data Pattern Searching
-When `get_xrefs_to` returns nothing (common for data in unanalyzed regions):
-1. Take the target address (e.g., `0x0044ebac`)
-2. Convert to little-endian bytes: `ac eb 44 00`
-3. Use `search_byte_patterns` with those bytes
-4. This finds any code that references that address as an immediate operand
+- No GUI tools in headless mode (`launch_codebrowser`, `goto_address` will fail)
+- Binary loading is HTTP-only — use `curl` or ask Claude to do it
+- Dynamic imports (`GetProcAddress`) won't appear in `list_imports` — search string list
+- For data xrefs: convert address to little-endian bytes, use `search_byte_patterns`

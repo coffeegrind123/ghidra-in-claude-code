@@ -1,8 +1,12 @@
 {
   "mcpServers": {
     "ghidra": {
-      "command": "/bin/bash",
-      "args": ["/path/to/run-ghidra-mcp-bridge.sh"]
+      "command": "python3",
+      "args": ["/path/to/launch_ghidra_mcp.py"],
+      "env": {
+        "GHIDRA_HOME": "/opt/ghidra_12.0.3_PUBLIC",
+        "JAVA_HOME": "/opt/jdk-21"
+      }
     }
   }
 }
