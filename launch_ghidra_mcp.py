@@ -118,6 +118,24 @@ server_proc = subprocess.Popen(
     stderr=subprocess.STDOUT,
 )
 
+# Wait for Java server to be ready (up to 30s)
+import socket as _sock
+import time as _time
+
+for i in range(60):
+    if server_proc.poll() is not None:
+        print("Error: Ghidra server exited prematurely. Check /tmp/ghidra-mcp-server.log", file=sys.stderr)
+        sys.exit(1)
+    try:
+        s = _sock.create_connection(("127.0.0.1", int(PORT)), timeout=0.5)
+        s.close()
+        break
+    except (ConnectionRefusedError, OSError):
+        _time.sleep(0.5)
+else:
+    print(f"Error: Ghidra server did not start within 30s on port {PORT}", file=sys.stderr)
+    cleanup()
+
 # Run the MCP bridge on stdio
 bridge = os.path.join(MCP_DIR, "bridge_mcp_ghidra.py")
 if not os.path.isfile(bridge):
