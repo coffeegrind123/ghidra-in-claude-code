@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
 Ghidra MCP launcher — starts headless Ghidra server + MCP bridge.
-
-Starts GhidraMCPHeadlessServer on localhost:8089 (configurable via
-GHIDRA_MCP_PORT), then execs bridge_mcp_ghidra.py on stdio for the
-MCP protocol.
-
-Environment variables:
-  JAVA_HOME       — JDK 21+ installation (auto-detected if unset)
-  GHIDRA_HOME     — Ghidra installation directory
-  GHIDRA_MCP_PORT — Headless server port (default: 8089)
-  GHIDRA_MCP_DIR  — Directory containing bridge + GhidraMCP ZIP (default: script dir)
 """
 import glob
 import os
@@ -20,29 +10,17 @@ import sys
 
 
 def find_java_home():
-    """Find a JDK 21+ installation."""
-    # Explicit env var
     if os.environ.get("JAVA_HOME") and os.path.isfile(
         os.path.join(os.environ["JAVA_HOME"], "bin", "java")
     ):
         return os.environ["JAVA_HOME"]
-
-    # Check java on PATH
     try:
-        result = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=5)
         output = result.stderr or result.stdout or ""
         import re
-
         match = re.search(r'version "(\d+)', output)
         if match and int(match.group(1)) >= 21:
-            which = subprocess.run(
-                ["which", "java"], capture_output=True, text=True, timeout=5
-            )
+            which = subprocess.run(["which", "java"], capture_output=True, text=True, timeout=5)
             if which.returncode == 0:
                 real = os.path.realpath(which.stdout.strip())
                 home = os.path.dirname(os.path.dirname(real))
@@ -50,7 +28,6 @@ def find_java_home():
                     return home
     except Exception:
         pass
-
     return None
 
 
@@ -72,7 +49,7 @@ os.environ["JAVA_HOME"] = JAVA_HOME
 os.environ["GHIDRA_HOME"] = GHIDRA_HOME
 os.environ["PATH"] = os.path.join(JAVA_HOME, "bin") + ":" + os.environ.get("PATH", "")
 
-# Build classpath from Ghidra JARs
+# Build flat classpath from all Ghidra jars + extension
 classpath = []
 for pattern in [
     os.path.join(GHIDRA_HOME, "Ghidra", "Framework", "*", "lib", "*.jar"),
@@ -80,7 +57,7 @@ for pattern in [
     os.path.join(GHIDRA_HOME, "Ghidra", "Processors", "*", "lib", "*.jar"),
     os.path.join(GHIDRA_HOME, "Extensions", "Ghidra", "GhidraMCP", "lib", "*.jar"),
 ]:
-    classpath.extend(glob.glob(pattern))
+    classpath.extend(sorted(glob.glob(pattern)))
 
 if not classpath:
     print("Error: No Ghidra JARs found. Check GHIDRA_HOME.", file=sys.stderr)
@@ -98,14 +75,12 @@ def cleanup(*_):
 signal.signal(signal.SIGTERM, cleanup)
 signal.signal(signal.SIGINT, cleanup)
 
-# Start headless Ghidra MCP server
+# Start headless Ghidra MCP server — flat classpath, no Ghidra module system
 server_proc = subprocess.Popen(
     [
         os.path.join(JAVA_HOME, "bin", "java"),
         "-Xmx4g",
         "-XX:+UseG1GC",
-        f"-Dghidra.home={GHIDRA_HOME}",
-        "-Dapplication.name=GhidraMCP",
         "-classpath",
         ":".join(classpath),
         "com.xebyte.headless.GhidraMCPHeadlessServer",
