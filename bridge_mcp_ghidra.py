@@ -1160,20 +1160,20 @@ async def _headless_import(
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if proc.returncode == 0:
-            # Try to open the imported program via the server
+            # Load the imported program into the running headless server
+            load_result = None
             try:
-                dispatch_post("/open_program", {
-                    "project_path": os.path.join(project_dir, project_name),
-                    "file_name": Path(file_path).name,
-                })
-            except Exception:
-                pass
+                load_result = dispatch_post("/load_program", {"file": file_path})
+                logger.info(f"load_program result: {load_result}")
+            except Exception as e:
+                logger.warning(f"load_program failed: {e}")
             return json.dumps({
-                "result": f"Imported {file_path} via headless analyzer",
+                "result": f"Imported and loaded {Path(file_path).name} via headless analyzer",
                 "data": {
                     "name": Path(file_path).name,
                     "project": project_name,
                     "analyzing": auto_analyze,
+                    "loaded": load_result,
                 },
                 "headless_output": output[-500:] if len(output) > 500 else output,
             })
