@@ -1124,6 +1124,67 @@ async def check_tools(tools: str) -> str:
     )
 
 
+async def _headless_import(
+    file_path: str,
+    language: str | None = None,
+    compiler_spec: str | None = None,
+    auto_analyze: bool = True,
+) -> str:
+    """Import a binary using Ghidra's analyzeHeadless."""
+    ghidra_home = os.environ.get("GHIDRA_HOME", "")
+    analyze_script = os.path.join(ghidra_home, "support", "analyzeHeadless")
+    if not os.path.isfile(analyze_script):
+        return json.dumps({"error": f"analyzeHeadless not found at {analyze_script}"})
+
+    project_dir = "/tmp/ghidra-projects"
+    os.makedirs(project_dir, exist_ok=True)
+    project_name = Path(file_path).stem
+
+    cmd = [analyze_script, project_dir, project_name, "-import", file_path]
+    if not auto_analyze:
+        cmd.append("-noanalysis")
+    if language:
+        cmd.extend(["-processor", language])
+    if compiler_spec:
+        cmd.extend(["-cspec", compiler_spec])
+    cmd.append("-overwrite")
+
+    logger.info(f"Headless import: {' '.join(cmd)}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "GHIDRA_HOME": ghidra_home},
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+        if proc.returncode == 0:
+            # Try to open the imported program via the server
+            try:
+                dispatch_post("/open_program", {
+                    "project_path": os.path.join(project_dir, project_name),
+                    "file_name": Path(file_path).name,
+                })
+            except Exception:
+                pass
+            return json.dumps({
+                "result": f"Imported {file_path} via headless analyzer",
+                "data": {
+                    "name": Path(file_path).name,
+                    "project": project_name,
+                    "analyzing": auto_analyze,
+                },
+                "headless_output": output[-500:] if len(output) > 500 else output,
+            })
+        else:
+            return json.dumps({"error": f"analyzeHeadless failed (exit {proc.returncode})", "output": output[-500:]})
+    except asyncio.TimeoutError:
+        return json.dumps({"error": "analyzeHeadless timed out (600s)"})
+    except Exception as e:
+        return json.dumps({"error": f"Headless import failed: {e}"})
+
+
 @mcp.tool()
 async def import_file(
     file_path: str,
@@ -1134,14 +1195,9 @@ async def import_file(
     ctx: Context | None = None,
 ) -> str:
     """
-    Import a binary file from disk into the current Ghidra project.
+    Import a binary file into Ghidra using the headless analyzer.
 
-    Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
-    When analysis is enabled, sends a log notification when analysis completes.
-
-    For raw firmware binaries, specify language (e.g. "ARM:LE:32:Cortex") and
-    optionally compiler_spec (e.g. "default"). Without language, Ghidra auto-detects
-    the format (works for ELF, PE, Mach-O, etc.).
+    Runs analyzeHeadless to import and optionally auto-analyze the binary.
 
     Args:
         file_path: Absolute path to the binary file on disk
@@ -1150,183 +1206,7 @@ async def import_file(
         compiler_spec: Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.
         auto_analyze: Start auto-analysis after import (default: true)
     """
-    payload: dict = {
-        "file_path": file_path,
-        "project_folder": project_folder,
-        "auto_analyze": auto_analyze,
-    }
-    if language:
-        payload["language"] = language
-    if compiler_spec:
-        payload["compiler_spec"] = compiler_spec
-
-    result = dispatch_post("/import_file", payload)
-
-    # Parse result to check if analysis was started
-    try:
-        data = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        return result
-
-    # Headless fallback: if GUI mode import fails, use analyzeHeadless
-    if isinstance(data, dict) and "error" in data.get("result", data.get("error", "")):
-        error_msg = data.get("result", data.get("error", ""))
-        if "GUI" in str(error_msg) or "PluginTool" in str(error_msg):
-            return await _headless_import(file_path, language, compiler_spec, auto_analyze)
-
-    # Headless fallback: if GUI mode import fails, use analyzeHeadless
-    if isinstance(data, dict) and "error" in data.get("result", data.get("error", "")):
-        error_msg = data.get("result", data.get("error", ""))
-        if "GUI" in str(error_msg) or "PluginTool" in str(error_msg):
-            return await _headless_import(file_path, language, compiler_spec, auto_analyze)
-
-    if data.get("data", {}).get("analyzing") and ctx is not None:
-        program_name = data["data"].get("name", "unknown")
-        # Capture the session before the tool call returns
-        session = ctx.request_context.session
-
-        async def _poll_analysis():
-            """Poll analysis_status until analysis completes, then send log notification."""
-            await asyncio.sleep(5)  # Initial delay
-            for _ in range(360):  # Up to 30 minutes
-                try:
-                    status_text = dispatch_get(
-                        "/analysis_status", {"program": program_name}
-                    )
-                    status = json.loads(status_text)
-                    status_data = status.get("data", status)
-                    if not status_data.get("analyzing", True):
-                        fn_count = status_data.get("function_count", "?")
-                        await session.send_log_message(
-                            level="info",
-                            data=f"Analysis complete for {program_name}: {fn_count} functions found",
-                        )
-                        return
-                except Exception as e:
-                    logger.debug(f"Analysis poll error for {program_name}: {e}")
-                await asyncio.sleep(5)
-
-        asyncio.create_task(_poll_analysis())
-
-    return result
-
-
-
-async def _headless_import(
-    file_path: str,
-    language: str | None = None,
-    compiler_spec: str | None = None,
-    auto_analyze: bool = True,
-) -> str:
-    """Import a binary using Ghidra's analyzeHeadless (headless fallback)."""
-    ghidra_home = os.environ.get("GHIDRA_HOME", "")
-    analyze_script = os.path.join(ghidra_home, "support", "analyzeHeadless")
-    if not os.path.isfile(analyze_script):
-        return json.dumps({"error": f"analyzeHeadless not found at {analyze_script}"})
-
-    project_dir = "/tmp/ghidra-projects"
-    os.makedirs(project_dir, exist_ok=True)
-    project_name = Path(file_path).stem
-
-    cmd = [analyze_script, project_dir, project_name, "-import", file_path]
-    if not auto_analyze:
-        cmd.append("-noanalysis")
-    if language:
-        cmd.extend(["-processor", language])
-    if compiler_spec:
-        cmd.extend(["-cspec", compiler_spec])
-    cmd.append("-overwrite")
-
-    logger.info(f"Headless import: {' '.join(cmd)}")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "GHIDRA_HOME": ghidra_home},
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
-        output = stdout.decode("utf-8", errors="replace") if stdout else ""
-        if proc.returncode == 0:
-            # Try to open the imported program via the server
-            open_result = dispatch_post("/open_program", {
-                "project_path": os.path.join(project_dir, project_name),
-                "file_name": Path(file_path).name,
-            })
-            return json.dumps({
-                "result": f"Imported {file_path} via headless analyzer",
-                "data": {
-                    "name": Path(file_path).name,
-                    "project": project_name,
-                    "analyzing": auto_analyze,
-                },
-                "headless_output": output[-500:] if len(output) > 500 else output,
-            })
-        else:
-            return json.dumps({"error": f"analyzeHeadless failed (exit {proc.returncode})", "output": output[-500:]})
-    except asyncio.TimeoutError:
-        return json.dumps({"error": "analyzeHeadless timed out (600s)"})
-    except Exception as e:
-        return json.dumps({"error": f"Headless import failed: {e}"})
-
-
-
-async def _headless_import(
-    file_path: str,
-    language: str | None = None,
-    compiler_spec: str | None = None,
-    auto_analyze: bool = True,
-) -> str:
-    """Import a binary using Ghidra's analyzeHeadless (headless fallback)."""
-    ghidra_home = os.environ.get("GHIDRA_HOME", "")
-    analyze_script = os.path.join(ghidra_home, "support", "analyzeHeadless")
-    if not os.path.isfile(analyze_script):
-        return json.dumps({"error": f"analyzeHeadless not found at {analyze_script}"})
-
-    project_dir = "/tmp/ghidra-projects"
-    os.makedirs(project_dir, exist_ok=True)
-    project_name = Path(file_path).stem
-
-    cmd = [analyze_script, project_dir, project_name, "-import", file_path]
-    if not auto_analyze:
-        cmd.append("-noanalysis")
-    if language:
-        cmd.extend(["-processor", language])
-    if compiler_spec:
-        cmd.extend(["-cspec", compiler_spec])
-    cmd.append("-overwrite")
-
-    logger.info(f"Headless import: {' '.join(cmd)}")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "GHIDRA_HOME": ghidra_home},
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
-        output = stdout.decode("utf-8", errors="replace") if stdout else ""
-        if proc.returncode == 0:
-            # Try to open the imported program via the server
-            open_result = dispatch_post("/open_program", {
-                "project_path": os.path.join(project_dir, project_name),
-                "file_name": Path(file_path).name,
-            })
-            return json.dumps({
-                "result": f"Imported {file_path} via headless analyzer",
-                "data": {
-                    "name": Path(file_path).name,
-                    "project": project_name,
-                    "analyzing": auto_analyze,
-                },
-                "headless_output": output[-500:] if len(output) > 500 else output,
-            })
-        else:
-            return json.dumps({"error": f"analyzeHeadless failed (exit {proc.returncode})", "output": output[-500:]})
-    except asyncio.TimeoutError:
-        return json.dumps({"error": "analyzeHeadless timed out (600s)"})
-    except Exception as e:
-        return json.dumps({"error": f"Headless import failed: {e}"})
+    return await _headless_import(file_path, language, compiler_spec, auto_analyze)
 
 
 # ==========================================================================
